@@ -1,22 +1,18 @@
+# Bürokrati provtöö.
+
+This document outline solution on migrating Ruuter and Resql to Java 21 and update documentation for ease of unboarding and general knowledge
+
 ## 1. Migration from Java 17 to Java 21
-# Java 21 Migration Plan
 
-Two event-driven REST microservices, both on Spring Boot 3.2.5, migrating from Java 17 to 21.
+### 1. Risks of Java 21 Adoption
 
-- **Project A (SQL-MS)** — Maven, REST → DB query service
-- **Project B (Ruuter)** — Gradle, REST → REST routing service
-
----
-
-## 1. Risks of Java 21 Adoption
-
-### Shared Risks
+#### Shared Risks
 
 - **Stronger encapsulation** — any `--add-opens` flags from the Java 11→17 upgrade need auditing
 - **Behavioral changes** — minor `HashMap`/`HashSet` iteration order differences can cause flaky tests
 - Spring Boot 3.2.5 officially supports Java 21, so framework-level risk is minimal
 
-### Project A
+### Resql
 
 | Risk | Severity | Detail |
 |------|----------|--------|
@@ -25,7 +21,7 @@ Two event-driven REST microservices, both on Spring Boot 3.2.5, migrating from J
 | PostgreSQL driver (42.3.9) | Medium | Works on Java 21 but has known CVEs. |
 | OpenTelemetry BOM runtime scope | Low | Declared with `runtime` scope, doesn't function as version management. |
 
-### Project B
+### Ruuter
 
 | Risk | Severity | Detail |
 |------|----------|--------|
@@ -40,11 +36,11 @@ Two event-driven REST microservices, both on Spring Boot 3.2.5, migrating from J
 
 ## 2. Impact on Spring/Jakarta Stack
 
-Both projects already completed the `javax` → `jakarta` namespace migration. Project A uses `jakarta.servlet` imports; the only `javax` found is `javax.sql.DataSource` which is JDK-native and stays as-is.
+Both projects already completed the `javax` → `jakarta` namespace migration. `Resql` uses `jakarta.servlet` imports; the only `javax` found is `javax.sql.DataSource` which is JDK-native and stays as-is.
 
 Java 21 introduces no new Jakarta EE requirements. Spring Boot 3.4.x offers better Java 21 support (virtual threads auto-config) but upgrading is optional.
 
-**Exception**: `id-log` in Project A contains `javax.servlet` classes. Only two classes are used — recommend rewriting them in-project with `jakarta.servlet` imports (~50–100 lines) and removing the dependency.
+**Exception**: `id-log` in Resql contains `javax.servlet` classes. Only two classes are used — recommend rewriting them in-project with `jakarta.servlet` imports (~50–100 lines) and removing the dependency.
 
 ---
 
@@ -52,16 +48,16 @@ Java 21 introduces no new Jakarta EE requirements. Spring Boot 3.4.x offers bett
 
 REST API contracts are unaffected — external consumers won't notice the JDK change.
 
-Build and runtime JDK must both be 21. For Project A (WAR), the servlet container must also support Java 21 (Spring Boot 3.2.5 embedded Tomcat does).
+Build and runtime JDK must both be 21. For Resql (WAR), the servlet container must also support Java 21 (Spring Boot 3.2.5 embedded Tomcat does).
 
-**Project A** — update POM:
+**Resql** — update POM:
 ```xml
 <java.version>21</java.version>
 <maven.compiler.source>21</maven.compiler.source>
 <maven.compiler.target>21</maven.compiler.target>
 ```
 
-**Project B** — add to `build.gradle`:
+**Ruuter** — add to `build.gradle`:
 ```groovy
 java {
     sourceCompatibility = JavaVersion.VERSION_21
@@ -76,8 +72,8 @@ java {
 1. **Static analysis** — run `jdeps --jdk-internals` on all JARs (especially `id-log`) to detect illegal internal API usage
 2. **Compile on JDK 21** without code changes — catches most issues immediately
 3. **Dependency tree analysis** — `mvn dependency:tree` / `gradle dependencies` to find conflicts
-4. **Run existing tests on JDK 21** — Project B must first re-enable its disabled tests
-5. **Staging deployment** — smoke tests, core business scenarios, GraalVM JS evaluation (Project B), DB queries (Project A)
+4. **Run existing tests on JDK 21** — Ruuter must first re-enable its disabled tests
+5. **Staging deployment** — smoke tests, core business scenarios, GraalVM JS evaluation (Ruuter), DB queries (Resql)
 
 ---
 
@@ -135,13 +131,13 @@ public ProblemDetail handleUnexpected(Exception ex, HttpServletRequest request) 
 }
 ```
 
-For Project B (REST→REST), propagate `X-Correlation-Id` header to downstream services so errors can be traced across the chain.
+For Ruuter (REST→REST), propagate `X-Correlation-Id` header to downstream services so errors can be traced across the chain.
 
 ---
 
 ## 7. Retry Strategy
 
-Primarily relevant for **Project B** (REST→REST router). Two options:
+Primarily relevant for **Ruuter** (REST→REST router). Two options:
 
 **Spring Retry** (simpler):
 ```java
@@ -170,39 +166,11 @@ resilience4j:
 
 Key rules: retry only recoverable errors (connection failures, 502/503/504 — never 4xx), use exponential backoff, and only retry idempotent operations (GET, PUT). Be cautious with POST.
 
-**Project A** — DB retry is mostly handled by HikariCP connection pool. Consider retry only for transient DB errors.
+**Resql** — DB retry is mostly handled by HikariCP connection pool. Consider retry only for transient DB errors.
 
 ---
 
-## Task Summary
-
-### Project A (SQL-MS)
-
-| # | Task | Priority | Effort |
-|---|------|----------|--------|
-| 1 | Remove Spring Cloud BOM | Low | 5 min |
-| 2 | Rewrite `GenericHeaderLogHandler` + `LogHandler`, remove `id-log` | High | 0.5–1 day |
-| 3 | Upgrade PostgreSQL driver → 42.7.x | Medium | 15 min |
-| 4 | Fix OpenTelemetry BOM scope | Low | 10 min |
-| 5 | Set Java 21 in POM | High | 5 min |
-| 6 | Run `jdeps --jdk-internals` | High | 30 min |
-| 7 | Run tests on JDK 21 | High | 1–2 hrs |
-| 8 | Implement unified error handling | Medium | 1–2 days |
-
-### Project B (Ruuter)
-
-| # | Task | Priority | Effort |
-|---|------|----------|--------|
-| 1 | Add Java 21 source/target compatibility | High | 5 min |
-| 2 | Test GraalVM JS engine on Java 21 | High | 1–2 days |
-| 3 | Replace `wiremock-jre8` → `org.wiremock:wiremock:3.x` | Medium | 30 min |
-| 4 | Remove `mockito-inline` | Low | 5 min |
-| 5 | Upgrade HttpClient 4.x → 5.x | Medium | 0.5–1 day |
-| 6 | Upgrade OpenTelemetry BOM → 1.37+ | Low | 15 min |
-| 7 | Re-enable and fix tests | High | 1–3 days |
-| 8 | Implement retry/circuit breaker | Medium | 1–2 days |
-| 9 | Implement unified error handling | Medium | 1–2 days |
-## 2. Improving Ruuter Documentation.
+## 2. Update Resql Documentation
 
 ### Define which sections of documentation should be updated.
 
