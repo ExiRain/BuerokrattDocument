@@ -383,69 +383,358 @@ Create a dedicated `SECURITY.md` document and link to it from both README.md and
 
 #### Current State
 
-Resql has the Swagger/OpenAPI dependency `springdoc-openapi-starter-webmvc-ui:2.5.0` declared in the POM, which is the correct library for Spring Boot 3.x. However, the Swagger UI page is currently inaccessible due to a controller mapping conflict.
+The Swagger/OpenAPI dependency in the POM is `springdoc-openapi-ui:1.8.0` — this is the Spring Boot 2.x / `javax` namespace variant and is incompatible with the current Spring Boot 3.x / Jakarta EE 9+ stack. It must be replaced with the correct Spring Boot 3.x dependency.
 
-The `QueryController` uses a wildcard path mapping (`/{project}/**`) which intercepts all incoming requests, including those destined for the Swagger UI paths (`/swagger-ui/**`, `/v3/api-docs/**`). This means the Swagger UI page is effectively blocked by the application's own routing.
+The `QueryController` uses wildcard path mappings (`/{project}/**`) which intercept all root-level requests, including Swagger UI paths (`/swagger-ui/**`, `/v3/api-docs/**`), making the documentation page inaccessible.
 
-Additionally, the existing API annotations are minimal. The POST endpoint has a single `@Operation(description = "Initiates previously configured POST queries")` annotation with no parameter descriptions, no response examples, and no documentation of possible error responses.
+Endpoint annotations are minimal — a single `@Operation(description=...)` per method with no parameter, response, or schema documentation. The service layer has no Javadoc.
 
-#### Recommended Changes
+#### Solution Proposal
 
-**Fix the Swagger UI access issue** — two approaches:
+##### Step 1 — Replace the Dependency
 
-1. **Add an API path prefix**: Change the controller base mapping from `/{project}/**` to `/api/{project}/**`. This separates application endpoints from framework endpoints (Swagger, Actuator) and is the cleaner architectural approach. However, this changes the API contract and requires coordinating with all consumers (primarily Ruuter's DSL configurations).
-2. **Exclude Swagger paths explicitly**: Configure Spring to prioritize Swagger paths over the wildcard controller. This can be done via path matching configuration without changing the API contract.
+Replace the incompatible Spring Boot 2.x dependency with the correct Spring Boot 3.x version:
 
-**Improve endpoint annotations** — all controller methods (`QueryController`, `DataSourceController`, `HeartBeatController`, `SwaggerController`) should have complete OpenAPI annotations:
+```xml
+<dependency>
+    <groupId>org.springdoc</groupId>
+    <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+    <version>2.5.0</version>
+</dependency>
+```
 
-- `@Operation` with meaningful summaries and descriptions
-- `@Parameter` annotations for path variables and request body fields
-- `@ApiResponse` annotations documenting all possible response codes (200, 400, 404, 500) and their meaning
-- Request and response body examples using `@Schema` annotations
+##### Step 2 — Resolve the Swagger UI Path Conflict
 
-**Verify the dependency** — ensure there are no remnants of the old Spring Boot 2.x Swagger dependency (`springdoc-openapi-ui:1.8.0`). If both old and new dependencies exist in the POM, the old one should be removed to avoid classpath conflicts.
+Add an `/api` prefix to the query controller to separate application routes from framework routes:
+
+```java
+@RestController
+@RequestMapping("/api")
+public class QueryController {
+    @PostMapping("/{project}/**")
+    // ...
+    @GetMapping("/{project}/**")
+    // ...
+}
+```
+
+This establishes a clear convention: `/api/**` is application logic, everything else (`/swagger-ui/**`, `/actuator/**`, `/datasources/**`) is infrastructure. All consumers (primarily Ruuter DSL configurations) will need to update their endpoint URLs to include the `/api` prefix.
+
+##### Step 3 — Create an OpenAPI Configuration Class
+
+Add a central configuration that defines the API's identity in Swagger UI:
+
+```java
+@Configuration
+public class OpenApiConfiguration {
+ 
+    @Bean
+    public OpenAPI resqlOpenAPI() {
+        return new OpenAPI()
+            .info(new Info()
+                .title("Resql API")
+                .description("Central database query microservice. Executes pre-configured "
+                    + "SQL queries via REST endpoints with dynamic datasource routing. "
+                    + "Intended for internal network access only.")
+                .version("0.0.1-SNAPSHOT")
+                .contact(new Contact()
+                    .name("Bürokratt Team")))
+            .servers(List.of(
+                new Server().url("/").description("Current environment")));
+    }
+}
+```
+
+##### Step 4 — Annotate Controllers
+
+Each endpoint should have complete OpenAPI annotations — operation summary, parameter descriptions, response codes, and request/response examples.
+
+Example for `QueryController` POST endpoint:
+
+```java
+@Operation(
+    summary = "Execute a configured POST query",
+    description = "Executes a pre-configured SQL query identified by the URL path. "
+        + "The {project} segment determines the datasource, and the remaining path "
+        + "identifies the query file. Parameters in the request body are passed "
+        + "as named parameters to the SQL query.")
+@ApiResponses({
+    @ApiResponse(responseCode = "200", description = "Query executed successfully",
+        content = @Content(mediaType = "application/json",
+            schema = @Schema(type = "array",
+                example = "[{\"id\": 1, \"name\": \"example\"}]"))),
+    @ApiResponse(responseCode = "404", description = "Query not found at the specified path"),
+    @ApiResponse(responseCode = "500", description = "Internal error during query execution")
+})
+@PostMapping(value = "/{project}/**")
+public List<Map<String, Object>> execute(
+    @Parameter(description = "Project/datasource identifier", example = "byk", required = true)
+    @PathVariable String project,
+    @io.swagger.v3.oas.annotations.parameters.RequestBody(
+        description = "Named parameters to pass to the SQL query. Keys must match "
+            + "parameter placeholders in the query file.",
+        content = @Content(mediaType = "application/json",
+            schema = @Schema(type = "object",
+                example = "{\"userId\": 123, \"status\": \"active\"}")))
+    @RequestBody(required = false) Map<String, Object> parameters,
+    HttpServletRequest request) {
+    // ...
+}
+```
+
+Example for the batch endpoint:
+
+```java
+@Operation(
+    summary = "Execute queries in batch mode",
+    description = "Executes the same query multiple times with different parameter sets. "
+        + "Results are returned in the same order as the input queries.")
+@ApiResponses({
+    @ApiResponse(responseCode = "200", description = "All queries executed successfully"),
+    @ApiResponse(responseCode = "400", description = "Request body is null or malformed"),
+    @ApiResponse(responseCode = "500", description = "One or more queries failed")
+})
+@PostMapping("/{name}/batch")
+public List<List<Map<String, Object>>> executeBatch(
+    @Parameter(description = "Query name identifier", required = true)
+    @PathVariable String name,
+    @RequestBody BatchRequest batchRequest) {
+    // ...
+}
+```
+
+Example for `DataSourceController`:
+
+```java
+@Operation(
+    summary = "List all configured datasources",
+    description = "Returns configuration details of all registered datasources. "
+        + "Passwords and sensitive credentials are excluded from the response.")
+@ApiResponse(responseCode = "200", description = "Datasource list retrieved successfully",
+    content = @Content(mediaType = "application/json",
+        array = @ArraySchema(schema = @Schema(implementation = DataSourceConfigProperties.class))))
+@GetMapping
+public List<DataSourceConfigProperties> findAll() {
+    // ...
+}
+```
+
+##### Step 5 — Annotate DTOs and Models
+
+All objects appearing in API requests or responses should have `@Schema` annotations with field descriptions and examples.
+
+`HeartBeatInfo`:
+```java
+@Data
+@Builder
+@Schema(description = "Application health and version information")
+public class HeartBeatInfo {
+    @Schema(description = "Application name", example = "sql-ms")
+    private String appName;
+ 
+    @Schema(description = "Application version from build info", example = "0.0.1-SNAPSHOT")
+    private String version;
+ 
+    @Schema(description = "Timestamp when the application was packaged (epoch millis)",
+            example = "1700000000000")
+    private long packagingTime;
+ 
+    @Schema(description = "Timestamp when the application started (epoch millis)",
+            example = "1700001000000")
+    private long appStartTime;
+ 
+    @Schema(description = "Current server timestamp (epoch millis)",
+            example = "1700002000000")
+    private long serverTime;
+}
+```
+
+`BatchRequest` (consider extracting from the inline record in `QueryController` to its own file for better visibility):
+```java
+@Schema(description = "Batch query execution request containing multiple parameter sets")
+public record BatchRequest(
+    @Schema(description = "List of parameter maps, each representing one query execution",
+            requiredMode = Schema.RequiredMode.REQUIRED,
+            example = "[{\"userId\": 1}, {\"userId\": 2}]")
+    List<Map<String, Object>> queries
+) {
+    public BatchRequest {
+        Objects.requireNonNull(queries);
+    }
+}
+```
+
+`DataSourceConfigProperties` — annotate all fields with `@Schema`. Ensure sensitive fields (passwords, connection strings with credentials) are marked with `@Schema(hidden = true)` or `@JsonIgnore` to enforce exclusion at the schema level, not just by convention.
+
+`SavedQuery` — primarily internal (not in API responses), but should have Javadoc for developer documentation. Note the hardcoded `"byk"` datasource name as a known limitation:
+```java
+/**
+ * Represents a loaded SQL query paired with its target datasource.
+ * Queries are loaded from filesystem paths and associated with a datasource name
+ * that maps to a configured DataSource via RoutingDataSource.
+ *
+ * Known limitation: datasource name is currently hardcoded to "byk".
+ * See TODO in getDatabaseName() for multi-datasource support.
+ */
+public record SavedQuery(String query, String dataSourceName) { ... }
+```
+
+##### Step 6 — Add Javadoc to the Service Layer
+
+While Javadoc does not appear in Swagger UI, it is essential for developers working on the codebase. Each service class and its public methods should document what it does, how it resolves inputs, what exceptions it throws, and any side effects.
+
+Example for `QueryService`:
+```java
+/**
+ * Core query execution service. Resolves REST request paths to pre-configured
+ * SQL query files and executes them against the appropriate datasource.
+ *
+ * Query resolution: /{project}/{httpMethod}/{queryPath} maps to a SQL file
+ * on the filesystem. The project determines the datasource via RoutingDataSource.
+ */
+@Service
+public class QueryService {
+ 
+    /**
+     * Executes a named SQL query with the given parameters.
+     *
+     * @param project    the project/datasource identifier used for routing
+     * @param httpMethod the HTTP method (GET/POST) determining the query directory
+     * @param name       the query path relative to the method directory
+     * @param parameters named parameters to bind to the SQL query (nullable for GET)
+     * @return list of result rows, each row as a map of column names to values
+     * @throws NotFoundException if no query file exists at the resolved path
+     * @throws ResqlRuntimeException if query execution fails
+     */
+    public List<Map<String, Object>> execute(String project, String httpMethod,
+                                              String name, Map<String, Object> parameters) {
+        // ...
+    }
+}
+```
+
+Apply similar Javadoc to `SavedQueryService` (query loading, caching behavior, filesystem path resolution), `ServerInfoService` (what server information it provides), and `HeartBeatService` (health data collection, how `packagingTime` is determined).
+ 
+---
 
 ### 3.2 How to Better Document Configuration Parameters
 
 #### Current State
 
-Resql has no configuration documentation. The `application.yml` file contains configuration for datasource connections, security headers (Content-Security-Policy), heartbeat properties, and other runtime settings, but none of these are documented in any README or separate document. New developers must read the application.yml and the source code (particularly `DataSourceConfigProperties` and `ApplicationProperties`-equivalent classes) to understand what can be configured and what the defaults are.
+Resql has no configuration documentation. The `application.yml` file and property classes (`DataSourceConfigProperties`) are the only source of truth, requiring developers to read source code to understand what is configurable.
 
-#### Recommended Changes
+#### Solution Proposal
 
-Create a dedicated `CONFIGURATION.md` document covering:
+Create a dedicated `CONFIGURATION.md` covering:
 
-- **Datasource configuration**: How to configure database connections, including the dynamic multi-datasource routing mechanism (`RoutingDataSource`). Document how `DataSourceContextHolder` determines which database is queried, how to add new datasources, and the expected configuration format in `application.yml`.
-- **Security headers**: The `headers.content-security-policy` property and its purpose. Document the default value and guidance for customizing it per environment.
-- **Heartbeat configuration**: The `heartbeat.properties` file and its role in health monitoring.
-- **Query configuration**: How SQL queries are defined, stored (in the `resources/script` directory), and mapped to REST endpoints. This is the core functionality of Resql and is currently undocumented.
-- **H2 configuration**: The in-memory H2 database is included as a runtime dependency — document its intended use (likely for development/testing) and how to switch between H2 and PostgreSQL.
-- **Logging configuration**: The `logback-spring.xml` configuration and any relevant logging properties.
+**Datasource Configuration**
+- How to configure database connections in `application.yml` (JDBC URL, username, password, driver class)
+- How dynamic multi-datasource routing works: the relationship between `DataSourceConfigProperties`, `RoutingDataSource`, and `DataSourceContextHolder`
+- How the `{project}` path variable maps to a specific datasource at runtime
+- The current limitation where the datasource name is hardcoded to `"byk"` in `SavedQuery.getDatabaseName()` and what this means for multi-datasource setups
+- How to add a new datasource: what configuration to add and how to register it in the routing layer
+- Connection pool settings (HikariCP properties: `maximum-pool-size`, `connection-timeout`, `idle-timeout`)
 
-Restructure the main `README.md` to link to `CONFIGURATION.md` rather than attempting to document configuration inline.
+**Query Configuration**
+- Where SQL query files are stored (`resources/script` directory) and how they are structured
+- The naming convention and directory structure that maps filesystem paths to REST endpoints
+- How parameterized queries work: how request body keys bind to SQL placeholders
+- How GET vs POST queries differ in parameter passing (query params vs request body)
+
+**Security Headers**
+- The `headers.content-security-policy` property: what it controls, current default value, guidance for customizing per environment
+
+**Heartbeat Configuration**
+- The `heartbeat.properties` file: what properties it contains and how `HeartBeatService` uses them
+
+**H2 Database**
+- The H2 in-memory database dependency: its purpose (development/testing environments)
+- How to switch between H2 and PostgreSQL via Spring profiles
+
+**Logging**
+- The `logback-spring.xml` configuration: logging levels, output format, how to adjust per environment
+
+Restructure the main `README.md` to link to `CONFIGURATION.md` rather than documenting configuration inline.
+ 
+---
 
 ### 3.3 How to Better Document Use Cases and Security Risks
 
 #### Current State
 
-Resql has no documentation covering its intended use cases, deployment model, or security posture. The `SecurityConfiguration` class sets `authorizeHttpRequests` to `permitAll()` and disables CSRF protection. There is no documentation explaining whether this is intentional or an oversight. There is no documentation covering the security implications of exposing SQL query execution via REST endpoints.
+Resql has no documentation explaining its purpose, deployment model, or security posture. The `SecurityConfiguration` uses `permitAll()` with CSRF disabled and no inline comments explaining why. For a service that executes SQL queries via REST, this undocumented security model is a significant operational risk — new developers cannot distinguish intentional design from oversight.
 
-#### Recommended Changes
+#### Solution Proposal
 
-Create a dedicated `SECURITY.md` document covering:
+Create three documents and restructure `README.md` to link to all of them.
 
-- **Deployment security model**: Resql is designed to run exclusively within the internal Kubernetes network. It is not intended to be accessible from external networks. The `permitAll()` security configuration is a **deliberate architectural decision** based on the assumption that network-level access control (Kubernetes network policies, pod-level isolation) prevents unauthorized access. This must be stated explicitly so that future developers understand the security contract and do not accidentally expose Resql to external traffic.
-- **The Ruuter → Resql trust boundary**: Resql's primary consumer is Ruuter, which acts as the public-facing gateway. Ruuter is responsible for authentication, authorization, request validation, and IP filtering. Resql trusts all requests that reach it because only authorized internal services should be able to reach it. Document this trust chain clearly.
-- **SQL injection risks**: Resql executes SQL queries with parameters passed via REST request bodies. Document how query parameterization works (prepared statements via `JdbcTemplate`), what protections exist against SQL injection, and what the developer's responsibilities are when writing new query configurations.
-- **CSRF disabled**: Document why CSRF protection is disabled. For a stateless REST API that does not use cookie-based authentication and is not accessed by browsers directly, CSRF protection is unnecessary. This should be stated as the rationale.
-- **Content-Security-Policy**: The `headers.content-security-policy` configuration is present but its purpose and recommended values are not documented.
+##### SECURITY.md
 
-Additionally, create a `GUIDE.md` document for Resql covering:
+**Deployment Security Model**
 
-- **What Resql is**: A microservice that executes pre-configured SQL queries via REST endpoints with dynamic datasource routing.
-- **How to add new queries**: The process for adding SQL query files to `resources/script`, mapping them to endpoints, and configuring datasource routing.
-- **How to add new datasources**: The process for configuring additional database connections in the dynamic routing setup.
-- **API usage examples**: Complete request/response examples for all endpoint types (GET queries, POST queries, datasource management, heartbeat).
-- **Error handling**: What errors the API returns and what they mean — integrating with the RFC 7807 `ProblemDetail` format recommended in the migration chapter.
+Resql runs exclusively within the internal Kubernetes network as a pod with no external ingress. The `permitAll()` security configuration is a deliberate architectural decision — Resql delegates authentication and authorization to the gateway layer (Ruuter). Network-level access control (Kubernetes network policies, pod isolation) enforces this boundary. This must be stated explicitly and prominently so that anyone reviewing the code understands the design intent.
 
-Restructure the main `README.md` to provide a brief introduction to Resql, then link to GUIDE.md, CONFIGURATION.md, and SECURITY.md for details.
+**The Ruuter → Resql Trust Boundary**
+
+The intended call chain: external clients → Ruuter (validates requests, evaluates DSL routing, enforces IP filtering, forwards to authentication endpoints) → Resql (executes database queries, trusts all requests that reach it).
+
+This trust model has specific implications that should be documented:
+- If Kubernetes network policies are misconfigured and Resql becomes externally reachable, there is no application-level security preventing unauthorized query execution
+- If another internal service is compromised, it can issue arbitrary queries to Resql
+- These risks should be accompanied by mitigation guidance (network policy validation, monitoring, potential future addition of internal API keys or mTLS)
+
+**SQL Injection Prevention**
+
+Document how query parameterization works: queries use `JdbcTemplate` with bound parameter placeholders (not string concatenation), and the SQL queries themselves are pre-configured files loaded from disk — users cannot submit arbitrary SQL. Document what validations exist on parameter values before they reach the query executor.
+
+**CSRF Disabled**
+
+Resql is a stateless REST API without cookie-based authentication, session management, or direct browser access. CSRF protection serves no purpose for machine-to-machine APIs — disabling it is correct for this architecture.
+
+**Content-Security-Policy**
+
+Document the `headers.content-security-policy` property: its purpose, current value, and guidance per environment.
+
+##### GUIDE.md
+
+**What Resql Is**
+
+Resql is a centralized database query microservice that exposes pre-configured SQL queries as REST endpoints with dynamic datasource routing. It receives HTTP requests, resolves the query from the filesystem, binds parameters, executes against the appropriate database, and returns JSON results.
+
+**Request Lifecycle**
+
+Walk through a complete request:
+1. Client sends `POST /byk/get-user` with body `{"userId": 123}`
+2. `QueryController` parses the path: project = `byk`, query path = `/get-user`
+3. `QueryService` resolves the query file from the filesystem
+4. `RoutingDataSource` routes to the correct database based on the project name
+5. `ResqlJdbcTemplate` executes the parameterized query
+6. Results returned as a JSON array of row objects
+
+Include concrete examples: simple GET query, simple POST query, batch execution, adding a new query file.
+
+**How to Add New Queries**
+
+Step-by-step: where to create the SQL file, how to name it, how to reference parameters, how to test it via REST.
+
+**How to Add New Datasources**
+
+Step-by-step: what to add in `application.yml`, how the routing key maps to `{project}`, and the current `"byk"` hardcoding limitation.
+
+**Error Handling**
+
+Map existing exceptions to HTTP responses:
+- `NotFoundException` → 404 (query file not found)
+- `InvalidQueryException` → 400 (invalid or missing parameters)
+- `InvalidDirectoryException` → 500 (query directory misconfigured)
+- `UnknownDataSourceNameException` → 500 (datasource not configured)
+- `ResqlRuntimeException` → 500 (unexpected execution error)
+
+##### Updated README.md
+
+Restructure to serve as the entry point:
+- Brief introduction: what Resql is (2–3 sentences)
+- Architecture note: internal-only service, called primarily by Ruuter
+- Links to `GUIDE.md`, `CONFIGURATION.md`, `SECURITY.md`
+- Docker / build / test commands (keep existing)
+- License information
