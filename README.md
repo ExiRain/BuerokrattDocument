@@ -11,6 +11,14 @@ Both were originally built on Java 11, then upgraded to Java 17 without thorough
 
 The deployment architecture follows a trust boundary model: external traffic reaches Ruuter, which validates requests via guard DSL files (cookie authentication or nonce validation), evaluates DSL routing rules, and forwards calls to internal services. Resql and other internal services (DataMapper, etc.) are only reachable from within the Kubernetes cluster, operating with permissive security (`permitAll()`) by design.
 
+### General Code Hygiene
+
+During the code review, several instances of hardcoded values and unused imports were identified across both projects. These should be addressed as part of the migration effort:
+
+- Hardcoded values (datasource names, paths, timezone defaults) should be externalized to `application.yml` configuration to support environment-specific overrides without code changes.
+- Unused imports and dead code should be cleaned up to reduce confusion for developers onboarding to the codebase.
+- These are minor but compound issues that affect maintainability. A single cleanup pass during the migration is the most efficient time to address them.
+
 ---
 
 ## 1. Migration from Java 17 to Java 21
@@ -19,45 +27,49 @@ The deployment architecture follows a trust boundary model: external traffic rea
 
 #### Shared Risks
 
-- **Stronger encapsulation** — Java 21 further tightens access to internal JDK APIs. Any `--add-opens` or `--add-exports` JVM flags that were introduced during the Java 11→17 upgrade need to be audited. These flags may exist in Dockerfiles, startup scripts, or CI pipelines. They still function on Java 21 but mask underlying issues that should be resolved properly.
+- **Stronger encapsulation** — Java 21 further tightens access to internal JDK APIs. Any `--add-opens` or `--add-exports` JVM flags introduced during the Java 11→17 upgrade need to be audited. These flags may exist in Dockerfiles, startup scripts, or CI pipelines. They still function on Java 21 but mask underlying issues that should be resolved properly.
 - **Behavioral changes** — Minor `HashMap`/`HashSet` iteration order differences across JDK builds can cause inconsistent results in code or tests that depend on iteration order. This is relevant for Ruuter's DSL evaluation where `LinkedHashMap` is used in some paths but standard `HashMap` in others within `ScriptingHelper`.
 - **Virtual threads caveat** — Java 21 introduces virtual threads as a production-ready feature. Both projects use thread-local patterns (`DataSourceContextHolder` in Resql, request context passing in Ruuter) that would behave unexpectedly with virtual threads. Adopting virtual threads is optional and not part of this migration, but should be noted for future architecture decisions. Spring Boot 3.2.5 does not enable virtual threads by default.
 - **Framework-level risk is minimal** — Spring Boot 3.2.5 officially supports Java 21. No Spring-specific breaking changes are expected from the JDK version bump.
+
+#### Codebase Health Observations
+
+During the analysis, both projects were found to have test coverage concerns that directly affect migration confidence. Resql has a small but functional integration test suite (`QueryControllerIntegrationTest` with MockMvc assertions) that can serve as a validation baseline. Ruuter, however, has no functional test coverage — test execution is disabled in the Gradle build configuration (`exclude '**/*'`), and the test methods themselves are commented out with `//TODO: tests are currently broken`. The test classes exist (`HttpHelperTest`, `DslMappingHelperTest`, `ExternalForwardingHelperTest`, `ScriptingHelperIT`, `DslServiceIT`, and others), but their implementations need to be restored before they can provide any validation. As part of the migration effort, restoring and stabilizing Ruuter's test suite should be treated as a prerequisite — not an afterthought — since it is the only automated way to verify that DSL evaluation, script execution, and HTTP forwarding behave correctly after the JDK upgrade.
 
 #### Resql-Specific Risks
 
 | Risk | Severity | Detail |
 |------|----------|--------|
-| `id-log` library (system-scoped) | Critical | Compiled with **Java 11 bytecode**, contains `javax.servlet.http.HttpServletRequest` and `javax.servlet.http.HttpServletResponse` imports — Java EE namespace classes incompatible with Spring Boot 3.x / Jakarta EE 9+. Code review of `RestConfiguration.java` confirms both `LogHandler` and `GenericHeaderLogHandler` are **actively registered as interceptors** via `addInterceptors()` and execute on every request — these are not dormant classes. The library is also declared with Maven `system` scope and a hardcoded `systemPath`, which is inherently fragile: no version resolution, no conflict detection, and the JAR is referenced by absolute filesystem path. |
-| Spring Cloud BOM (2021.0.2) | Low | Declared in POM but targets Spring Boot 2.6.x/2.7.x. Full codebase search confirmed zero usage: no `org.springframework.cloud` imports, no `spring.cloud.*` properties, no Spring Cloud annotations. Only "cloud" matches are SonarCloud CI config and already-commented-out POM entries. Dead dependency — safe to remove. |
+| `id-log` library (system-scoped) | Critical | Compiled with **Java 11 bytecode**, contains `javax.servlet` imports incompatible with Spring Boot 3.x / Jakarta EE 9+. Code review of `RestConfiguration.java` confirms both `LogHandler` and `GenericHeaderLogHandler` are **actively registered as interceptors** via `addInterceptors()` and execute on every request — these are not dormant. The library uses Maven `system` scope with a hardcoded `systemPath` — no version resolution, no conflict detection, filesystem-path-dependent. |
+| Spring Cloud BOM (2021.0.2) | Low | Targets Spring Boot 2.6.x/2.7.x. Full codebase search confirmed zero usage: no imports, no config properties, no annotations. Dead dependency — safe to remove. |
 | PostgreSQL driver (42.3.9) | Medium | Functions on Java 21 but contains known CVEs. Significantly behind latest stable (42.7.x). |
-| OpenTelemetry BOM scope | Low | Declared with `<scope>runtime</scope>`, preventing it from functioning as version management. Should be moved to `<dependencyManagement>` without scope. |
-| Dynamic datasource routing | None | `RoutingDataSource` extends `AbstractRoutingDataSource` with standard thread-local lookup. No behavioral changes between Java 17 and 21. |
+| OpenTelemetry BOM scope | Low | Declared with `runtime` scope, preventing version management. Should be in `dependencyManagement` without scope. |
+| Dynamic datasource routing | None | Standard `AbstractRoutingDataSource` with thread-local lookup. No behavioral changes between Java 17 and 21. |
 
 #### Ruuter-Specific Risks
 
 | Risk | Severity | Detail |
 |------|----------|--------|
-| GraalVM JS Engine (23.0.1) | Medium | `ScriptEngineConfiguration` uses JSR-223 SPI (`ScriptEngineManager().getEngineByName("graal.js")`) in interpreter-only mode. The `javax.script.*` imports are **JDK-native** (not Jakarta) — safe. The risk is version targeting: GraalVM `23.0.x` targets JDK 20; JDK 21 alignment requires `23.1.x` or `24.x`. Critical because `ScriptingHelper` is the **core DSL engine** — every request flows through `engine.eval()`. Fix is straightforward: bump version if smoke test fails. |
-| Apache HttpClient 4.5.13 | Medium | EOL. Functions on Java 21 but receives no patches. Replacement is `httpclient5`. Central dependency for `ExternalForwardingHelper` and `HttpHelper`. |
-| WireMock `wiremock-jre8` (2.35.1) | Medium | Deprecated variant. Java 21 requires `org.wiremock:wiremock:3.x` (new Maven group ID). Test infrastructure only. |
-| Mockito version conflict | Low | `mockito-inline:4.9.0` alongside `mockito-core:5.6.0`. Mockito 5.x includes inline mocking by default — `mockito-inline` is redundant and the version mismatch causes unpredictable test behavior. |
-| All tests disabled | High | `exclude '**/*'` in Gradle means zero tests run during builds. No safety net for migration. Must be addressed before any Java 21 work. |
-| Missing Java version target | Medium | No `sourceCompatibility`/`targetCompatibility` in `build.gradle`. Bytecode version depends on whichever JDK runs the build — implicit and fragile. |
+| GraalVM JS Engine (23.0.1) | Medium | Uses JSR-223 SPI in interpreter-only mode. `javax.script.*` imports are JDK-native — safe. Version targeting risk: `23.0.x` targets JDK 20; JDK 21 needs `23.1.x` or `24.x`. Critical because `ScriptingHelper` is the core DSL engine — every request flows through `engine.eval()`. Fix: bump version if smoke test fails. |
+| Apache HttpClient 4.5.13 | Medium | EOL. Functions on Java 21 but receives no patches. Replacement: `httpclient5`. Central for `ExternalForwardingHelper` and `HttpHelper`. |
+| WireMock `wiremock-jre8` (2.35.1) | Medium | Deprecated variant. Java 21 requires `org.wiremock:wiremock:3.x` (new group ID). Test infrastructure only. |
+| Mockito version conflict | Low | `mockito-inline:4.9.0` alongside `mockito-core:5.6.0`. Mockito 5.x includes inline mocking — remove `mockito-inline`. |
+| All tests non-functional | High | Tests are both excluded in Gradle (`exclude '**/*'`) and commented out at source level (`//TODO: tests are currently broken`). No safety net. Must be addressed before migration. |
+| Missing Java version target | Medium | No `sourceCompatibility`/`targetCompatibility`. Bytecode version depends on build-time JDK — implicit and fragile. |
 
 ---
 
 ### 1.2 Impact on Spring/Jakarta Stack
 
-The `javax` → `jakarta` namespace migration (required by Spring Boot 3.x / Jakarta EE 9+) is **already complete** in both projects.
+The `javax` → `jakarta` namespace migration is **already complete** in both projects.
 
-**Resql**: All servlet imports use `jakarta.servlet`. The only `javax` import is `javax.sql.DataSource` in `ResqlJdbcTemplate` — part of the JDK's `java.sql` module, not subject to Jakarta rename.
+**Resql**: All servlet imports use `jakarta.servlet`. The only `javax` is `javax.sql.DataSource` — JDK-native (`java.sql` module), not subject to rename.
 
-**Ruuter**: `javax.script.ScriptEngine`, `javax.script.Bindings`, and `javax.script.ScriptEngineManager` in the scripting layer belong to the JDK's `java.scripting` module — JDK-native, will never be renamed.
+**Ruuter**: `javax.script.*` imports in the scripting layer are JDK-native (`java.scripting` module) — will never be renamed.
 
 Java 21 introduces no new Jakarta EE requirements. Spring Boot 3.4.x offers virtual thread auto-config but upgrading is optional.
 
-**Exception**: The `id-log` library in Resql contains `javax.servlet` (Java EE) classes. `RestConfiguration` actively registers both interceptors on every request. The project uses only `GenericHeaderLogHandler` and `LogHandler` — simple logging interceptors. Solution: rewrite these two classes (~50–100 lines) in-project using `jakarta.servlet` imports and remove the `id-log` dependency entirely. This eliminates the `javax.servlet` incompatibility, the Java 11 bytecode mismatch, and the fragile system-scoped Maven dependency.
+**Exception**: The `id-log` library in Resql contains `javax.servlet` classes and is actively registered in `RestConfiguration.addInterceptors()`. Solution: rewrite `GenericHeaderLogHandler` and `LogHandler` (~50–100 lines) in-project using `jakarta.servlet` imports. Remove the `id-log` dependency. This eliminates the namespace incompatibility, the Java 11 bytecode mismatch, and the fragile system-scoped dependency.
 
 ---
 
@@ -65,17 +77,17 @@ Java 21 introduces no new Jakarta EE requirements. Spring Boot 3.4.x offers virt
 
 #### API Contract Level
 
-REST API contracts are unaffected — external consumers will not notice any difference. Request/response formats, endpoints, and behavior remain identical.
+REST API contracts are unaffected — external consumers will not notice any difference. The JDK upgrade is a runtime-level change that does not alter either service's public interface. Ruuter DSL configurations calling Resql endpoints continue to work without modification.
 
 #### Runtime Environment Alignment
 
-Build-time and runtime JDK must both be Java 21.
+Both services run as Docker images in Kubernetes pods. The JDK version must be consistent across three layers: build pipeline, Docker base image, and build configuration files. A mismatch — such as compiling with JDK 17 but targeting 21 in config — can cause subtle runtime failures despite clean compilation.
 
-**Resql** (WAR packaging) — the servlet container must support Java 21. Spring Boot 3.2.5 embedded Tomcat does. If deployed to an external Tomcat, that instance must also be updated.
-
-**Ruuter** (JAR packaging) — self-contained with embedded server. Only the JDK on the target host/container needs to be Java 21.
+Resql produces a WAR artifact but runs via Spring Boot's embedded Tomcat inside the container — no external servlet container is involved. Ruuter uses a multi-stage Docker build with an exploded JAR layout running via classpath entry point. In both cases, the only runtime dependency is the JDK in the base image.
 
 #### Build Configuration
+
+Both projects must explicitly declare Java 21 as the source and target to ensure bytecode compatibility and build reproducibility.
 
 **Resql** — update `pom.xml`:
 ```xml
@@ -84,7 +96,7 @@ Build-time and runtime JDK must both be Java 21.
 <maven.compiler.target>21</maven.compiler.target>
 ```
 
-**Ruuter** — add to `build.gradle`:
+**Ruuter** — add to `build.gradle` (currently missing — bytecode version depends on whichever JDK runs the build):
 ```groovy
 java {
     sourceCompatibility = JavaVersion.VERSION_21
@@ -92,12 +104,11 @@ java {
 }
 ```
 
-#### Docker and CI Pipeline
+#### Docker Images and CI Pipeline
 
-- Docker base images must be updated to JDK 21 (e.g., `eclipse-temurin:21-jre`). Both `Dockerfile` and `docker-compose.yml` must be reviewed.
-- CI pipeline JDK version must match.
-- Ruuter's Node.js tooling (`package.json`, Husky, bump-version.sh) is unaffected.
-- Gradle/Maven wrapper scripts are JDK-version-agnostic.
+Both Dockerfiles already use `eclipse-temurin:21-jdk-alpine` as the base image — no container-level changes are needed. Both `docker-compose.yml` files should be reviewed for any hardcoded JDK version references in build arguments or environment variables.
+
+CI pipelines must target JDK 21 for compilation and testing to match runtime. Ruuter's Node.js tooling and Gradle/Maven wrapper scripts are unaffected.
 
 #### Dependency Compatibility
 
@@ -105,42 +116,40 @@ java {
 |-----------|---------|---------|----------------|--------|
 | Spring Boot | Both | 3.2.5 | Officially supported | None |
 | PostgreSQL Driver | Resql | 42.3.9 | Works, has CVEs | Upgrade to 42.7.x |
-| GraalVM JS | Ruuter | 23.0.1 | Likely works, targets JDK 20 | Smoke test; bump to 23.1.x if needed |
+| GraalVM JS | Ruuter | 23.0.1 | Likely works, targets JDK 20 | Smoke test; bump if needed |
 | Apache HttpClient | Ruuter | 4.5.13 | Works, EOL | Migrate to httpclient5 |
-| WireMock | Ruuter | 2.35.1 (jre8) | Deprecated variant | Migrate to org.wiremock:wiremock:3.x |
+| WireMock | Ruuter | 2.35.1 | Deprecated variant | Migrate to wiremock 3.x |
 | Mockito | Ruuter | 5.6.0 + inline 4.9.0 | Version conflict | Remove mockito-inline |
-| id-log | Resql | 1.0.0-SNAPSHOT (J11) | Incompatible (javax.servlet) | Rewrite and remove |
+| id-log | Resql | 1.0.0-SNAPSHOT (J11) | Incompatible | Rewrite and remove |
 
 ---
 
-### 1.4 Testing the Migration
+### 1.4 How to Test for Migration Problems
 
-**Step 1 — Static Analysis**
+Migration from Java 17 to 21 can introduce problems at multiple levels — compilation, dependency resolution, and runtime behavior. Each level requires a different testing approach. Notably, both services already run on JDK 21 at the container level (`eclipse-temurin:21-jdk-alpine`), while build configurations still target Java 17. This means some migration problems may already be silently present but masked by the bytecode version mismatch.
 
-Run `jdeps --jdk-internals` on all artifacts to detect internal API usage:
-```bash
-jdeps --jdk-internals libs/id-log-1.0.0-SNAPSHOT.jar
-jdeps --jdk-internals target/sql-ms.war
-jdeps --jdk-internals build/libs/*.jar
-```
+**Static Analysis**
 
-**Step 2 — Compile on JDK 21** without code changes to isolate compilation-level issues.
+The `jdeps` tool (included with the JDK) scans compiled bytecode for usage of internal JDK APIs that may have been removed or further restricted between versions. Running `jdeps --jdk-internals` against all project artifacts and third-party JARs identifies classes relying on `sun.misc.*`, `com.sun.*`, or other internal APIs before any code changes are made. This is especially important for dependencies not managed through Maven/Gradle (such as Resql's system-scoped `id-log` library), where version management and compatibility are not tracked automatically.
 
-**Step 3 — Dependency Conflict Analysis**
-```bash
-mvn dependency:tree -Dverbose          # Resql
-gradle dependencies --configuration runtimeClasspath  # Ruuter
-```
+**Dependency Tree Verification**
 
-**Step 4 — Test Suites**
-- Resql: Run existing integration tests (`QueryControllerIntegrationTest`, etc.) on JDK 21.
-- Ruuter: **Remove `exclude '**/*'`** first, then run tests. Without this, all validation is manual.
+Maven's `dependency:tree` and Gradle's `dependencies` task expose the full resolved dependency graph, including transitive dependencies. After any version change — whether upgrading a library, removing a dead dependency, or replacing an incompatible one — the tree should be re-examined for conflicting versions, duplicate classes, and unexpected transitive pulls. Conflicts at this level manifest as `NoSuchMethodError` or `ClassNotFoundException` at runtime despite clean compilation, making them particularly difficult to diagnose without proactive verification.
 
-**Step 5 — Targeted Smoke Testing**
-- Ruuter: Boot on JDK 21, send a request triggering DSL script evaluation (`ScriptingHelper.evaluateScripts()` → `engine.eval()`). If this passes, the highest-risk item is cleared.
-- Resql: Execute queries through the REST API, including dynamic datasource routing scenarios.
+**Automated Test Suites**
 
-**Step 6 — Staging Deployment** — Full end-to-end testing of the Ruuter → Resql call chain in a staging environment mirroring production.
+Automated tests are the most reliable way to detect behavioral regressions — cases where code compiles and dependencies resolve correctly, but the application produces different results at runtime. Resql has a functional integration test suite (`QueryControllerIntegrationTest`) exercising the full request path, which can serve as a validation baseline. Ruuter's test suite is currently non-functional — execution is disabled in Gradle (`exclude '**/*'`) and test methods are commented out at source level (`//TODO: tests are currently broken`). The test classes exist (`HttpHelperTest`, `ScriptingHelperIT`, `DslServiceIT`, and others) but their implementations need to be restored. Restoring coverage should begin with `ScriptingHelperIT` (core DSL engine) and `HttpHelperTest` (outbound REST calls), as these cover the highest-risk migration areas.
+
+**Smoke Testing**
+
+Some migration problems only surface in a fully running application — particularly those involving runtime service discovery, classloader behavior, and third-party engine initialization. Two paths are critical:
+
+- Ruuter's GraalVM JS engine registers via JSR-223 SPI at startup. If the engine name `"graal.js"` fails to resolve on JDK 21, every DSL evaluation fails. A single request triggering script evaluation confirms or rules out this risk.
+- Resql's dynamic datasource routing relies on thread-local context switching through `RoutingDataSource`. A request exercising GET, POST, and batch endpoints with datasource routing validates the full query execution path.
+
+**End-to-End Validation in Staging**
+
+Individual service testing does not cover inter-service communication. Both services should be deployed together in a staging environment mirroring production (same Kubernetes configuration, network policies, database connectivity). Testing the full Ruuter → Resql chain — external request through guard authentication, DSL evaluation, internal service call, query execution, and response — validates that the migration does not break cross-service behavior. This should include both cookie-based and nonce-based authentication paths, as well as error scenarios (invalid paths, missing parameters, unavailable datasources) to verify error propagation across service boundaries.
 
 ---
 
@@ -148,9 +157,13 @@ gradle dependencies --configuration runtimeClasspath  # Ruuter
 
 #### 1.5.1 Distinguishing Error Types
 
-Resql has a `GlobalExceptionHandler` and typed exceptions (`InvalidDirectoryException`, `InvalidQueryException`, `ResqlRuntimeException`, `UnknownDataSourceNameException`). However, all are bare `RuntimeException` subclasses with only a message string — no error codes, no HTTP status mapping, no structured fields. Ruuter has its own set (`InvalidDslException`, `InvalidDslStepException`, `InvalidHttpMethodTypeException`, `LoadDslsException`, `ScriptEvaluationException`) plus hardcoded error codes (`E_unknown`, `E_null`, `E_script`).
+Both projects handle errors, but neither does so in a standardized or fully correct way.
 
-Both projects should standardize on Spring Boot 3.x's built-in RFC 7807 `ProblemDetail` for uniform, machine-parseable error responses:
+**Resql** has a `GlobalExceptionHandler` with a `@ControllerAdvice` that catches `ResqlRuntimeException` and a catch-all for `Exception`. However, both handlers return `400 BAD_REQUEST` regardless of the actual error type — meaning a missing query, a database connection failure, and an unexpected `NullPointerException` all produce the same HTTP status code. The response body is a custom `ErrorResponseBody` record with an exception class name and message, but no error code, no correlation ID, and no way for the caller to programmatically distinguish between error categories. A consumer receiving a 400 cannot know whether to retry (transient DB issue) or fix the request (bad parameters).
+
+**Ruuter** has no `@RestControllerAdvice` — errors during DSL execution are caught internally and wrapped in `DSLExecutionException`, which carries a `dslName`, `stepName`, `causeCode`, and `message`. This is a structured approach, but the cause code assignment contains a bug: the `if` chain does not use `else if`, so the `causeCode` is set by each matching condition and then overwritten by the final `else` branch. In practice, a `NullPointerException` sets `E_null` but immediately falls through to `E_unknown`, making the error codes unreliable. The structured `ErrorObject` is only returned when the `x-ruuter-testing` header is present — in normal operation, errors are either swallowed by `stopInCaseOfException` or returned as generic failures.
+
+Both projects should adopt Spring Boot 3.x's RFC 7807 `ProblemDetail` format, which provides a standardized, machine-parseable error response with proper HTTP status mapping:
 
 ```java
 @RestControllerAdvice
@@ -174,16 +187,25 @@ public class GlobalExceptionHandler {
 }
 ```
 
-This produces standardized JSON:
+For Resql, this means replacing the existing `GlobalExceptionHandler` with proper status code mapping: `InvalidQueryException` → 400, `NotFoundException` → 404, `UnknownDataSourceNameException` → 500, `ResqlRuntimeException` → 500 — instead of returning 400 for everything.
+
+For Ruuter, this means adding a `@RestControllerAdvice` alongside the existing DSL-level error handling, fixing the `DSLExecutionException` cause code bug (`if` → `else if`), and preserving the existing error codes (`E_unknown`, `E_null`, `E_script`, `E_network`) as `errorCode` properties within the `ProblemDetail` format.
+
+The standardized response format:
+
 ```json
 {"type":"about:blank","title":"Not Found","status":404,"detail":"Query 12345 not found","errorCode":"RESOURCE_NOT_FOUND"}
 ```
 
-Ruuter's existing error codes (`E_unknown`, `E_null`, `E_script`) should be preserved and integrated into the `ProblemDetail` format.
+This enables consumers — particularly Ruuter when calling Resql — to programmatically distinguish between client errors (don't retry), server errors (maybe retry), and upstream failures (retry with backoff).
 
 #### 1.5.2 Handling Unexpected Errors
 
-Catch-all handler that logs full context server-side, returns only a correlation ID to the client:
+Resql's current catch-all handler logs the error with `log.error()` but returns only the exception class name and message to the client as a `400 BAD_REQUEST`. There is no correlation between what the client sees and what appears in server logs — if multiple errors occur simultaneously, there is no way to match a client's error report to the corresponding log entry.
+
+Ruuter has no catch-all at the controller level. Unexpected exceptions during DSL execution are caught by the service layer and either swallowed (if `stopInCaseOfException` is false) or returned as a generic failure. Stack traces may appear in logs but have no link to the response the client received.
+
+The solution is a catch-all handler in both projects that generates a unique correlation ID per error, logs the full diagnostic context server-side, and returns only the correlation ID to the client:
 
 ```java
 @ExceptionHandler(Exception.class)
@@ -200,13 +222,18 @@ public ProblemDetail handleUnexpected(Exception ex, HttpServletRequest request) 
 }
 ```
 
-For the Ruuter → Resql call chain, propagate `X-Correlation-Id` header across service boundaries. This integrates with Ruuter's existing OpenSearch logging, making cross-service error tracing possible with a single identifier.
+For the Ruuter → Resql call chain, the `X-Correlation-Id` header should be propagated across service boundaries — when Ruuter receives an error from Resql, the correlation ID links the client-facing error in Ruuter to the server-side log entry in Resql. This integrates with Ruuter's existing OpenSearch logging, enabling cross-service error tracing with a single identifier.
 
 #### 1.5.3 Retry Strategy
 
-Primarily relevant for **Ruuter** where `ExternalForwardingHelper` and `HttpHelper` make outbound REST calls.
+Ruuter's architecture follows a fail-fast principle — cutting execution at the first sign of error. Retry logic is a deliberate exception to this philosophy, applied only to transient network failures where the request itself is valid but the downstream service is temporarily unreachable.
 
-**Spring Retry** (simpler, annotation-driven):
+Retry logic is primarily relevant for Ruuter, where `ExternalForwardingHelper` and `HttpHelper` make outbound REST calls that can fail due to transient network issues, service restarts, or temporary downstream unavailability. The `DSLExecutionException` already distinguishes `E_network` for `WebClientRequestException` — this is exactly the error type that benefits from retry.
+
+Two approaches are suitable depending on the level of control needed:
+
+**Spring Retry** provides annotation-driven retry with minimal configuration — suitable for straightforward cases where the retry policy is the same across all outbound calls:
+
 ```java
 @Retryable(
     retryFor = {UpstreamServiceException.class, ConnectException.class},
@@ -216,7 +243,8 @@ Primarily relevant for **Ruuter** where `ExternalForwardingHelper` and `HttpHelp
 public ResponseEntity<String> callUpstream(String url, Object payload) { ... }
 ```
 
-**Resilience4j** (more control, includes circuit breaker):
+**Resilience4j** adds circuit breaker capability on top of retry — when a downstream service is consistently failing, the circuit breaker stops sending requests for a configurable period, preventing cascade failures and giving the downstream service time to recover:
+
 ```yaml
 resilience4j:
   retry:
@@ -231,11 +259,11 @@ resilience4j:
         wait-duration-in-open-state: 10s
 ```
 
-Ruuter already has `externalForwarding.proceedPredicate.httpStatusCode` — retry logic should integrate with this existing mechanism.
+Both approaches should integrate with Ruuter's existing `externalForwarding.proceedPredicate.httpStatusCode` configuration, which already defines which HTTP status codes are acceptable for proceeding with DSL processing. The retry policy should align: status codes outside the `proceedPredicate` allowlist that indicate transient failure (502, 503, 504) should trigger retry, while client errors (4xx) should not.
 
-Key principles: retry only recoverable errors (connection failures, 502/503/504 — never 4xx), exponential backoff, idempotency awareness (safe for GET/PUT, cautious with POST).
+Key principles: use exponential backoff to avoid overwhelming recovering services, never retry non-idempotent operations (POST) without explicit confirmation of safety, and set a maximum retry duration to prevent requests from hanging indefinitely.
 
-**Resql** — HikariCP handles connection pool retry automatically. Additional retry only needed for transient DB errors (connection spikes).
+Resql's database connectivity retry is handled automatically by HikariCP, which maintains the connection pool and transparently recovers from connection loss. Additional retry logic should only be considered for transient PostgreSQL errors such as connection spikes or temporary `too many connections` scenarios.
 
 ---
 
@@ -243,27 +271,90 @@ Key principles: retry only recoverable errors (connection failures, 502/503/504 
 
 ### 2.1 How to Enhance or Restructure Documentation for Newer Developers
 
-Analysis of existing documentation identified the following: the `README.md` contains only Docker, build, and test commands with links to the Guide and Configuration — no introduction, no architecture context, no explanation of what Ruuter is. The `GUIDE.md` has solid DSL content (file structure, request types, responses, optional parameters, step types, scripting) but a flat structure with no progression from overview to detail. The `CONFIGURATION.md` is the most complete document, thoroughly covering DSL paths, exception handling, CORS, external forwarding, internal requests, OpenSearch logging, response limits, testing mode, and more.
+Analysis of existing documentation: the `README.md` contains only Docker, build, and test commands with links to Guide and Configuration — no introduction, no architecture context. The `GUIDE.md` has solid DSL content (file structure, request types, responses, optional parameters, step types, scripting) but a flat structure with no progression from overview to detail. The `CONFIGURATION.md` is the most complete document, covering DSL paths, exception handling, CORS, external forwarding, internal requests, OpenSearch logging, response limits, and more. Security and input validation are scattered or absent across all three documents.
 
 #### Solution Proposal
 
 **README.md** — restructure as the entry point:
-- Add an introduction explaining what Ruuter is: a service that executes custom DSL files to orchestrate REST-based workflows, acting as the gateway in the Bürokratt architecture
-- Add a high-level architecture overview: external traffic → Ruuter → internal services (Resql, DataMapper, etc.). Explain the dual deployment model — Public Ruuter and Private Ruuter are separate deployments of the same codebase, each with its own DSL files, isolated at the infrastructure level.
-- Add a quickstart section with a minimal DSL example including the mandatory declaration block, demonstrating request → guard → DSL → response
-- Keep Docker/build/test commands below the introduction
-- Link to GUIDE.md, CONFIGURATION.md, and a new SECURITY.md
+- Add an introduction explaining Ruuter: a service executing custom DSL files to orchestrate REST-based workflows, acting as the gateway in the Bürokratt architecture
+- Add architecture overview: external traffic → Ruuter → internal services. Explain the dual deployment model — Public and Private Ruuter are separate deployments of the same codebase with different DSL directories, isolated at infrastructure level.
+- Add a quickstart with a minimal DSL example including the mandatory declaration block
+- Keep Docker/build/test below the introduction
+- Link to GUIDE.md, CONFIGURATION.md, and new SECURITY.md
 
 **GUIDE.md** — restructure for progressive disclosure:
-- **Top**: General overview, directory structure (GET/POST as method directories with guard files), declaration block as mandatory first element. Distinguish regular DSL files from template DSL files (predefined flows for internal calls).
-- **Middle**: Detailed DSL writing — step types (`return`, `assign`, `mock`, `http-get`, `http-post`, `conditional-jump`, `template`), JavaScript scripting, parameter passing, jumps, skip, sleep. How guard files work as authentication middleware.
-- **Bottom**: Advanced topics — DSL reloading, default services, mock steps, batch processing, step-level recursion overrides.
+- **Top**: Overview, directory structure (GET/POST method directories with guard files), declaration block as mandatory first element. Distinguish regular DSLs from template DSLs (predefined internal flows).
+- **Middle**: Detailed DSL writing — step types, scripting, parameter passing, guard files as auth middleware. Include a practical multi-step workflow example (see below).
+- **Bottom**: Advanced topics — reloading, default services, mock steps, batch processing, recursion overrides.
 - Remove content duplicating CONFIGURATION.md; reference SECURITY.md for security topics.
 
+**Practical multi-step workflow example** to include in GUIDE.md, demonstrating a real routing scenario:
+
+```yaml
+declaration:
+  call: declare
+  version: 0.1
+  description: "Fetches user data and returns formatted response"
+  method: post
+  accepts: json
+  returns: json
+  namespace: backoffice
+  allowlist:
+    body:
+      - field: userId
+        type: number
+        description: "User ID to look up"
+    header:
+      - field: cookie
+        type: string
+        description: "Session cookie"
+
+get_user:
+  call: http.post
+  args:
+    url: "[#RESQL_URL]/byk/get-user-by-id"
+    body:
+      userId: ${incoming.body.userId}
+  result: user_response
+  next: check_result
+
+check_result:
+  switch:
+    - condition: ${user_response.response.body[0] == null}
+      next: not_found
+  next: format_response
+
+format_response:
+  assign:
+    user_name: ${user_response.response.body[0].firstName}
+  next: return_success
+
+return_success:
+  return: ${user_name}
+  status: 200
+  next: end
+
+not_found:
+  return: "User not found"
+  status: 404
+  next: end
+```
+
+This example demonstrates: declaration with body and header allowlist, HTTP call to an internal service (Resql), conditional branching with `switch`, variable assignment, and multiple return paths with status codes.
+
+**DSL Limitations** — consolidate into a clear section in GUIDE.md:
+- Undeclared parameters silently become `null` (declaration allowlist)
+- DSL files are loaded at startup — no hot-reload unless `allowDslReloading` is enabled
+- Step recursion is capped by `maxStepRecursions` (default 10)
+- Only lambda syntax for anonymous functions in JavaScript (curly braces reserved for DSL parameter identifiers)
+- DSL names must be unique within the same method directory, even across subdirectory levels
+- Disallowed file types in the DSL directory prevent Ruuter from starting entirely
+- `stopInCaseOfException` affects whether a failed step halts the entire DSL or allows subsequent steps to continue
+
 **CONFIGURATION.md** — minor improvements:
-- Add introductory text on where config lives (`application.yml`) and how to override per environment
+- Add intro on where config lives and how to override per environment
 - Ensure all examples include default values
-- Cross-reference SECURITY.md for security-related properties
+- Cross-reference SECURITY.md for security properties
 
 ### 2.2 How to Document Use and Validation of Inputs
 
@@ -305,26 +396,15 @@ The allowlist has three sections mapping to incoming request parts:
 | `params` | `incoming.params.*` | GET query parameters |
 | `header` | `incoming.headers.*` | HTTP request headers |
 
-Critical behavior: **any incoming field not listed in the allowlist is set to `null`**, even if the caller provides it. This is silent — no error, no warning. This is the most common source of bugs when writing new DSLs. The `namespace` field (e.g., `backoffice`, `service`, `analytics`) is a project identifier grouping DSLs by subsystem — it is not an access control mechanism.
+Critical behavior: **any incoming field not listed in the allowlist is set to `null`**, even if the caller provides it. This is silent — no error, no warning. The `namespace` field (e.g., `backoffice`, `service`, `analytics`) is a project identifier — not an access control mechanism.
 
-**DSL Validation**
-- Invalid YAML syntax — caught at startup or request time?
-- Non-existent step references or circular jumps — interaction with `maxStepRecursions`
-- Disallowed file types in DSL directory — application refuses to start (document prominently)
-- `LoadDslsException` behavior and operator actions
+**DSL Validation**: Invalid YAML syntax handling (startup vs runtime), non-existent step references, circular jumps with `maxStepRecursions`, disallowed file types (prevents startup), `LoadDslsException` behavior.
 
-**Script Validation**
-- JavaScript evaluation failures — `ScriptEvaluationException`
-- `stopInCaseOfException` behavior (halt vs continue)
-- Error codes: `E_unknown`, `E_null`, `E_script` from `DSLExecutionException`
+**Script Validation**: `ScriptEvaluationException` on failed JavaScript evaluation, `stopInCaseOfException` flow control, error codes `E_unknown`, `E_null`, `E_script` from `DSLExecutionException`.
 
-**HTTP Method Validation**
-- Response for methods not in `allowedMethodTypes`
-- Interaction between declaration `method` field, directory-level method, and global config
+**HTTP Method Validation**: Response for methods not in `allowedMethodTypes`, interaction between declaration `method` field, directory-level method, and global config.
 
-**Testing Mode**
-- `x-ruuter-testing` header with `apiRequestTestingKey` for diagnostic error responses
-- Error object structure: `dslName`, `stepName`, `causeCode`, `message`
+**Testing Mode**: `x-ruuter-testing` header with `apiRequestTestingKey` enables diagnostic error responses with `dslName`, `stepName`, `causeCode`, `message`.
 
 ### 2.3 Security Documentation
 
@@ -333,39 +413,25 @@ Create a dedicated `SECURITY.md` linked from README.md and GUIDE.md.
 **Architecture-Level Security Model**
 - Ruuter is the public-facing entry point enforcing the trust boundary
 - Internal services operate with `permitAll()` — reachable only within Kubernetes
-- Public Ruuter and Private Ruuter are **separate deployments** of the same codebase with different DSL files. The public/private boundary is enforced at infrastructure level (separate pods/images), not within the application.
+- Public and Private Ruuter are **separate deployments** — boundary enforced at infrastructure level
 
 **Authentication: Guard DSL Files**
 
-Authentication is implemented at the DSL level via guard files at the root of each method directory (GET/POST). Every request passes through the guard before reaching the target DSL. The guard implements a multi-path flow:
+Authentication is implemented at the DSL level via guard files at the root of each method directory. Every request passes through the guard. The guard implements:
 
-1. **Nonce-based authentication** — If the request contains `x-ruuter-nonce` header (or `ruuter-nonce` query param), validated against Resql as a single-use token. Used by internal systems (cron jobs, scheduled tasks) that operate within the internal network and cannot obtain browser cookies.
-2. **Cookie-based authentication** — If no nonce, checks for session cookie and validates via template call to the authentication layer (`check-user-authority`). Standard path for UI/browser requests.
+1. **Nonce-based authentication** — `x-ruuter-nonce` header validated against Resql as a single-use token. Used by internal systems (cron, scheduled tasks) that cannot obtain browser cookies.
+2. **Cookie-based authentication** — Session cookie validated via template call to `check-user-authority`. Standard path for UI/browser requests.
 3. **Rejection** — Neither valid nonce nor valid cookie → 403.
 
-Both Public and Private Ruuter use guard files. The guard implementation is itself a DSL — authentication logic is configurable and auditable without code changes.
+Both deployments use guard files. The guard is itself a DSL — authentication logic is configurable without code changes. As a potential future improvement, mTLS or shared secrets at Spring Security level could replace nonce management, though this would move auth outside the DSL engine.
 
-As a potential future improvement, service-to-service auth could use mTLS or shared secrets at the Spring Security level, removing nonce management overhead. However, this would move auth logic outside the DSL engine, contradicting the architecture where all request processing flows through DSLs.
+**Internal Service Access Control**: `allowedIPs` and `allowedURLs` for `internal` subdirectory DSLs, filtering behavior, unauthorized access response, allowlist maintenance.
 
-**Internal Service Access Control**
-- `allowedIPs` and `allowedURLs` for `internal` subdirectory DSLs
-- IP/referrer filtering behavior and unauthorized access response
-- Allowlist maintenance practices across environments
+**External Forwarding as Authentication**: `externalForwarding` as pre-processing validation hook, `proceedPredicate.httpStatusCode`, behavior when endpoint is unreachable.
 
-**External Forwarding as Authentication**
-- `externalForwarding` forwards requests to validation endpoint before DSL processing
-- `proceedPredicate.httpStatusCode` determines proceed/reject
-- Behavior when forwarding endpoint is unreachable
+**Script Evaluation Security**: GraalVM interpreter-only boundaries, JS access restrictions, script injection risk from untrusted input.
 
-**Script Evaluation Security**
-- GraalVM interpreter-only mode security boundaries
-- What JS code can/cannot access (network, filesystem, isolation between evaluations)
-- Script injection risk from untrusted input flowing into evaluation
-
-**CORS, Response Code Masking, Testing Mode**
-- `allowedOrigins` configuration per environment
-- `finalResponse` status code masking to prevent backend probing
-- `x-ruuter-testing` header exposes internal details — disable or secure in production
+**CORS, Response Code Masking, Testing Mode**: `allowedOrigins` per environment, `finalResponse` status codes to prevent backend probing, `x-ruuter-testing` exposure risk in production.
 
 ---
 
@@ -373,13 +439,14 @@ As a potential future improvement, service-to-service auth could use mTLS or sha
 
 ### 3.1 How to Improve Existing Swagger UI API Documentation
 
-Analysis of the codebase identified three issues: the Swagger dependency in the POM is `springdoc-openapi-ui:1.8.0` — the Spring Boot 2.x / `javax` namespace variant, incompatible with the current Boot 3.x stack. The `QueryController` uses wildcard mappings (`/{project}/**`) intercepting all root-level requests including Swagger UI paths, making the documentation page inaccessible. Endpoint annotations are minimal — one `@Operation(description=...)` per method with no parameter, response, or schema documentation. The service layer has no Javadoc.
+Analysis of the codebase identified three issues: the Swagger dependency is `springdoc-openapi-ui:1.8.0` (Spring Boot 2.x / `javax` variant, incompatible with Boot 3.x). The `QueryController` wildcard mapping `/{project}/**` intercepts Swagger UI paths, making documentation inaccessible. Endpoint annotations are minimal — one `@Operation(description=...)` per method. The service layer has no Javadoc.
 
 #### Solution Proposal
 
 ##### Step 1 — Replace the Dependency
 
-Replace the incompatible dependency with the Spring Boot 3.x version:
+Replace `springdoc-openapi-ui:1.8.0` with the Spring Boot 3.x compatible version:
+
 ```xml
 <dependency>
     <groupId>org.springdoc</groupId>
@@ -390,16 +457,17 @@ Replace the incompatible dependency with the Spring Boot 3.x version:
 
 ##### Step 2 — Resolve the Path Conflict
 
-Add an `/api` prefix to the query controller to separate application routes from framework routes:
+Currently controllers intercept the Swagger page, making it inaccessible. Add an `/api` prefix to separate application routes from framework routes. This also requires adjustments from the Ruuter side:
+
 ```java
 @RestController
 @RequestMapping("/api")
 public class QueryController { ... }
 ```
 
-This establishes a clear convention: `/api/**` is application logic, everything else (`/swagger-ui/**`, `/actuator/**`, `/datasources/**`) is infrastructure. Consumers (primarily Ruuter DSL configurations) will need to update endpoint URLs.
+##### Step 3 — OpenAPI Configuration Class
 
-##### Step 3 — Create an OpenAPI Configuration Class
+Resql currently has no central API metadata definition. Adding an `OpenApiConfiguration` class provides the "title page" for the Swagger UI — giving developers and consumers immediate context about what the service does, who maintains it, and the critical note that it is internal-only. This information renders at the top of the Swagger UI page and in the generated OpenAPI spec:
 
 ```java
 @Configuration
@@ -422,13 +490,13 @@ public class OpenApiConfiguration {
 
 ##### Step 4 — Annotate Controllers
 
-Each endpoint should have complete annotations — summary, parameters, response codes, examples:
+The existing controller annotations provide only a single-line `@Operation(description=...)` with no information about parameters, possible response codes, or request/response body structure. Each endpoint should be fully annotated so that the Swagger UI becomes a self-contained API reference — a consumer should be able to understand how to call the endpoint, what to send, and what to expect back, without reading source code. This includes `@Operation` with both a summary and description, `@Parameter` annotations for path variables and query parameters, `@ApiResponse` for each possible HTTP status code, and `@Content`/`@Schema` with concrete examples for request and response bodies:
 
 ```java
 @Operation(
     summary = "Execute a configured POST query",
     description = "Executes a pre-configured SQL query identified by the URL path. "
-        + "The {project} segment determines the datasource, and the remaining path "
+        + "The {project} segment determines the datasource, the remaining path "
         + "identifies the query file.")
 @ApiResponses({
     @ApiResponse(responseCode = "200", description = "Query executed successfully",
@@ -441,23 +509,17 @@ Each endpoint should have complete annotations — summary, parameters, response
 @PostMapping(value = "/{project}/**")
 public List<Map<String, Object>> execute(
     @Parameter(description = "Project/datasource identifier", example = "byk", required = true)
-    @PathVariable String project,
-    @io.swagger.v3.oas.annotations.parameters.RequestBody(
-        description = "Named parameters to bind to the SQL query.",
-        content = @Content(mediaType = "application/json",
-            schema = @Schema(type = "object",
-                example = "{\"userId\": 123, \"status\": \"active\"}")))
-    @RequestBody(required = false) Map<String, Object> parameters,
-    HttpServletRequest request) { ... }
+    @PathVariable String project, ...) { ... }
 ```
 
-Apply the same pattern to the batch endpoint, `DataSourceController`, and `HeartBeatController`.
+The same level of annotation should be applied to the batch endpoint, `DataSourceController`, and `HeartBeatController` — every public endpoint should be fully documented in the Swagger UI.
 
 ##### Step 5 — Annotate DTOs and Models
 
+Controller annotations alone are not enough — the "Schemas" section at the bottom of Swagger UI is only useful if the DTO and model classes carry `@Schema` annotations with field-level descriptions, types, and examples. Without these, the schema section shows raw field names with no context. Every object that appears in an API request or response should be annotated so that a developer can understand the data contract without reading Java source:
+
 ```java
-@Data
-@Builder
+@Data @Builder
 @Schema(description = "Application health and version information")
 public class HeartBeatInfo {
     @Schema(description = "Application name", example = "sql-ms")
@@ -473,34 +535,28 @@ public class HeartBeatInfo {
 }
 ```
 
-For `DataSourceConfigProperties` — mark sensitive fields (passwords, connection strings) with `@Schema(hidden = true)` or `@JsonIgnore` to enforce exclusion at the schema level. For `BatchRequest` — consider extracting from the inline record in `QueryController` for visibility and annotate with `@Schema`.
+For `DataSourceConfigProperties`, any sensitive fields (passwords, connection strings containing credentials) must be explicitly marked with `@Schema(hidden = true)` or `@JsonIgnore` to guarantee they never appear in the Swagger UI or API responses — this should be enforced at the schema level, not relied upon by convention. The `BatchRequest` record is currently defined inline inside `QueryController` — it should be extracted to its own file for better visibility and annotated with `@Schema` to document the expected batch input format.
 
-##### Step 6 — Add Javadoc to the Service Layer
+##### Step 6 — Javadoc on Service Layer
+
+While Javadoc does not render in Swagger UI, it is essential for developers working in the codebase. The service layer is where query resolution, datasource routing, and execution logic live — currently with no documentation. Each service class and its public methods should have Javadoc explaining what the method does, how it resolves its inputs (e.g., how a project name and path map to a SQL file on disk), what exceptions it throws and under what conditions, and any side effects such as caching:
 
 ```java
 /**
  * Core query execution service. Resolves REST paths to pre-configured
  * SQL files and executes them against the appropriate datasource.
  *
- * Resolution: /{project}/{httpMethod}/{queryPath} → SQL file on disk.
- * Project determines datasource via RoutingDataSource.
+ * @param project    datasource identifier for routing
+ * @param httpMethod determines query directory
+ * @param name       query path relative to method directory
+ * @param parameters named parameters to bind (nullable for GET)
+ * @return result rows as column-name-to-value maps
+ * @throws NotFoundException if query file not found
+ * @throws ResqlRuntimeException if execution fails
  */
-@Service
-public class QueryService {
-    /**
-     * @param project    datasource identifier for routing
-     * @param httpMethod HTTP method determining query directory
-     * @param name       query path relative to the method directory
-     * @param parameters named parameters to bind (nullable for GET)
-     * @return result rows as maps of column names to values
-     * @throws NotFoundException if query file not found
-     * @throws ResqlRuntimeException if execution fails
-     */
-    public List<Map<String, Object>> execute(...) { ... }
-}
 ```
 
-Apply to `SavedQueryService` (loading, caching, path resolution), `ServerInfoService`, and `HeartBeatService` (`packagingTime` sourced from `heartbeat.properties` via `PackageInfoConfiguration`).
+The same treatment should be applied to `SavedQueryService` (how queries are loaded from disk, whether results are cached, how filesystem paths are resolved), `ServerInfoService` (what server data it provides and where it sources it), and `HeartBeatService` (how `packagingTime` is determined — sourced from `heartbeat.properties` via `PackageInfoConfiguration` at build time).
 
 ---
 
@@ -509,118 +565,128 @@ Apply to `SavedQueryService` (loading, caching, path resolution), `ServerInfoSer
 Resql has no configuration documentation. Create a `CONFIGURATION.md` covering:
 
 **Datasource Configuration**
-- How to configure connections in `application.yml` via `sqlms.datasources` prefix (bound to `List<DataSourceConfigProperties>`)
-- How dynamic multi-datasource routing works: `DataSourceConfiguration` builds a `RoutingDataSource` from all configured datasources → `DataSourceContextHolder` (thread-local) sets the active datasource per request → `RoutingDataSource.determineCurrentLookupKey()` reads it
-- Current limitation: `SavedQuery.getDatabaseName()` is hardcoded to `"byk"` regardless of the project parameter — multi-datasource routing at the query level is not yet functional
-- Timezone handling: `DataSourceConfiguration` sets `SET TIME ZONE` via HikariCP's `connectionInitSql`, defaulting to `Europe/Tallinn`
+- Connections configured via `sqlms.datasources` prefix in `application.yml`, bound to `List<DataSourceConfigProperties>`
+- Dynamic routing: `DataSourceConfiguration` builds `RoutingDataSource` → `DataSourceContextHolder` (thread-local) sets active datasource per request → `RoutingDataSource.determineCurrentLookupKey()` reads it
+- Current limitation: `SavedQuery.getDatabaseName()` returns hardcoded `"byk"` — multi-datasource routing at query level not yet functional
+- Timezone: `DataSourceConfiguration` sets `SET TIME ZONE` via HikariCP `connectionInitSql`, defaults to `Europe/Tallinn`
 
-**Connection Pool (HikariCP)**
-- Relevant properties: `maximum-pool-size`, `connection-timeout`, `idle-timeout`, `max-lifetime`
-- Environment-specific guidance: development (small pool, short timeouts) vs production (larger pool, tuned for expected load)
-- Impact on reliability: an exhausted pool causes all requests to queue — critical for a service where every REST call holds a connection for the duration of query execution
+**Connection Pool (HikariCP) — Environment-Specific Configuration**
+
+The connection pool directly impacts reliability and performance. Configuration should differ by environment:
+
+| Property | Development | Staging | Production |
+|----------|-------------|---------|------------|
+| `maximum-pool-size` | 2–5 | 5–10 | 10–20 (tuned to load) |
+| `connection-timeout` | 30000ms | 20000ms | 10000ms |
+| `idle-timeout` | 600000ms | 300000ms | 180000ms |
+| `max-lifetime` | 1800000ms | 1200000ms | 900000ms |
+| `datasource.url` | H2 in-memory | PostgreSQL (staging DB) | PostgreSQL (production DB) |
+
+Example environment-specific configuration:
+
+```yaml
+# application-dev.yml
+sqlms:
+  datasources:
+    - name: byk
+      driverClassName: org.h2.Driver
+      jdbcUrl: jdbc:h2:mem:testdb
+      username: sa
+      password:
+      timeZone: Europe/Tallinn
+
+# application-prod.yml
+sqlms:
+  datasources:
+    - name: byk
+      driverClassName: org.postgresql.Driver
+      jdbcUrl: jdbc:postgresql://db-host:5432/buerokratt
+      username: ${DB_USERNAME}
+      password: ${DB_PASSWORD}
+      timeZone: Europe/Tallinn
+```
+
+**Reliability impact**: An undersized pool causes request queuing — every REST call holds a connection for the full duration of query execution. An oversized pool wastes database connections and can hit PostgreSQL's `max_connections` limit. `connection-timeout` determines how long a request waits for a free connection before failing — too high and users experience long hangs, too low and transient spikes cause unnecessary failures.
+
+**Performance impact**: `idle-timeout` and `max-lifetime` control connection recycling. Stale connections can cause intermittent failures. `max-lifetime` should be set lower than the database server's connection timeout to prevent the pool from holding dead connections.
 
 **Query Configuration**
-- SQL files stored under a configurable path, organized by project and HTTP method
-- Naming convention: filesystem path directly maps to REST endpoint
-- Named parameter syntax (`:paramName`) for parameterized queries
-- GET vs POST: query parameters vs request body
+- SQL files under configurable path, organized by project and HTTP method
+- Filesystem path directly maps to REST endpoint (path-based routing)
+- Named parameter syntax (`:paramName`) for prepared statements
+- GET: query parameters; POST: request body
 
 **Security Headers, Heartbeat, H2, Logging**
-- `headers.content-security-policy` property and per-environment guidance
-- `heartbeat.properties`: `app.name`, `app.version`, `app.packaging.time` — sourced at build time via `PackageInfoConfiguration`
-- H2 in-memory database for development/testing, profile-based switching to PostgreSQL
-- `logback-spring.xml` configuration and logging levels
-
-Restructure `README.md` to link to `CONFIGURATION.md`.
+- `headers.content-security-policy` and per-environment values
+- `heartbeat.properties`: `app.name`, `app.version`, `app.packaging.time`
+- H2 for dev/test, PostgreSQL for staging/production via Spring profiles
+- `logback-spring.xml` levels and format
 
 ---
 
 ### 3.3 How to Better Document Use Cases and Security Risks
 
-Resql's `SecurityConfiguration` uses `permitAll()` with CSRF disabled and no inline comments. For a service executing SQL via REST, this undocumented security posture is an operational risk. Create three documents and restructure `README.md` to link to all of them.
+Resql's `SecurityConfiguration` uses `permitAll()` with CSRF disabled and no documentation. Create three documents and restructure `README.md` to link to all.
 
 #### SECURITY.md
 
 **Deployment Security Model**
 
-Resql runs exclusively within the internal Kubernetes network as a pod with no external ingress. The `permitAll()` configuration is a deliberate architectural decision — Resql delegates authentication to the gateway layer (Ruuter). Network-level access control (Kubernetes network policies, pod isolation) enforces this boundary. This must be stated prominently.
+Resql runs exclusively within the internal Kubernetes network with no external ingress. `permitAll()` is a deliberate architectural decision — authentication is delegated to Ruuter. Network policies enforce the boundary.
 
 **The Ruuter → Resql Trust Boundary**
 
-Intended call chain: external clients → Ruuter (guard DSL authentication, DSL routing, IP filtering) → Resql (trusts all requests).
-
-Implications:
-- If Kubernetes network policies are misconfigured and Resql becomes externally reachable, there is no application-level security
-- A compromised internal service can issue arbitrary queries
-- Mitigations: network policy validation, monitoring, potential future mTLS or internal API keys
+Call chain: clients → Ruuter (guard DSL auth, routing, IP filtering) → Resql (trusts all). Implications: misconfigured network policies expose raw SQL execution; compromised internal services get full query access. Mitigations: network policy validation, monitoring, potential future mTLS.
 
 **SQL Injection Prevention**
 
-`ResqlJdbcTemplate` extends `NamedParameterJdbcTemplate` and uses `MapSqlParameterSource` — parameters are bound via prepared statements, never concatenated. SQL queries are pre-configured files loaded from disk — users cannot submit arbitrary SQL. However, the absence of input validation on parameter *values* before they reach the query executor should be noted.
+`ResqlJdbcTemplate` extends `NamedParameterJdbcTemplate` with `MapSqlParameterSource` — prepared statements, never concatenation. SQL files are pre-configured on disk — users cannot submit arbitrary SQL.
 
 **Allowed and Forbidden SQL Operations**
 
-There is no application-level restriction on SQL operation types. Any valid SQL can be placed in a query file:
+No application-level restriction on operation types exists. Any valid SQL placed in a file will execute via REST.
 
-*Allowed (intended use):*
-- Parameterized SELECT queries (primary use case)
-- Parameterized INSERT/UPDATE/DELETE — `queryOrExecute()` auto-detects writes via absent `ResultSetMetaData`
+*Allowed (intended):*
+- Parameterized SELECT, INSERT, UPDATE, DELETE — `queryOrExecute()` auto-detects via `ResultSetMetaData`
 
-*Forbidden (must be enforced by code review and convention):*
-- DDL operations (CREATE, DROP, ALTER, TRUNCATE) — no runtime guard prevents these from being exposed via REST
-- Unbounded SELECT queries without LIMIT — results load entirely into `List<Map>` in memory, risking `OutOfMemoryError`
+*Forbidden (enforced by convention and code review):*
+- DDL (CREATE, DROP, ALTER, TRUNCATE) — no runtime guard
+- Unbounded SELECTs without LIMIT — full result loaded into memory
 
-**Known Architectural Risks**
+**Known Architectural Risks and Reliability Impact**
 
-- **No query timeout** — `queryOrExecute()` sets no statement timeout. A runaway query holds a HikariCP connection indefinitely, eventually exhausting the pool. Mitigation: set `statement_timeout` at PostgreSQL level or via `connectionInitSql`.
-- **No result set size limit** — query results map directly into memory with no pagination or cap. Mitigation: enforce `LIMIT` in all SELECT queries.
-- **Batch operations without transactions** — `executeBatch` in `QueryController` calls `executePost` in a stream with no `@Transactional`. Partial failures leave data inconsistent — first two queries commit, third fails, fourth and fifth never execute. Mitigation: wrap in `@Transactional`.
-- **ThreadLocal datasource context not cleaned** — `DataSourceContextHolder.setDataSourceName()` is called per request but `clearDataSourceName()` is never called in the request flow. In a thread pool, the previous request's datasource can leak to the next request on the same thread. Mitigation: clear context in a servlet filter or `@After` advice.
+- **No query timeout** — `queryOrExecute()` sets no statement timeout. A runaway query holds a HikariCP connection indefinitely, eventually exhausting the pool and making the service unresponsive to all requests. Mitigation: configure `statement_timeout` at PostgreSQL level or via `connectionInitSql`.
+- **No result set size limit** — results map directly into `List<Map>` with no cap. A 10-million-row SELECT attempts to load everything into JVM heap → `OutOfMemoryError` → service crash. Mitigation: enforce `LIMIT` in all queries or implement result truncation.
+- **Batch without transactions** — `executeBatch` calls `executePost` in a stream with no `@Transactional`. If query 3 of 5 fails, queries 1–2 are committed, 4–5 never execute. Partial writes, inconsistent data. Mitigation: wrap in `@Transactional`.
+- **ThreadLocal datasource leak** — `DataSourceContextHolder.setDataSourceName()` is called but `clearDataSourceName()` is never called in the request flow. In a thread pool, the previous request's datasource context leaks to the next request on the same thread. Mitigation: clear in a servlet filter or interceptor.
+- **CORS wildcard default** — `RestConfiguration` defaults `cors.allowedOrigins` to `*`. Acceptable for internal-only but must be documented as intentional.
 
-**CSRF Disabled**
-
-Resql is a stateless REST API without cookie auth, sessions, or direct browser access. CSRF protection serves no purpose for machine-to-machine APIs — disabling it is correct.
-
-**CORS**
-
-`RestConfiguration` defaults `cors.allowedOrigins` to `*` (wildcard). For an internal-only service this is acceptable but should be documented as intentional.
+**CSRF Disabled** — Stateless API, no cookies/sessions, machine-to-machine only. Correct decision for this architecture.
 
 #### GUIDE.md
 
-**What Resql Is**
+**What Resql Is**: Centralized query microservice exposing pre-configured SQL as REST endpoints with dynamic datasource routing.
 
-Centralized database query microservice exposing pre-configured SQL queries as REST endpoints with dynamic datasource routing.
+**SQL File Lifecycle**:
 
-**SQL File Lifecycle**
+1. Developer writes `.sql` file with `:paramName` parameters
+2. Placed in `{config-path}/{project}/{METHOD}/query-name.sql`
+3. `SavedQueryService` loads files at startup into `SavedQuery` records
+4. Client sends `POST /byk/get-user` with `{"userId": 123}`
+5. `QueryController` parses: project=`byk`, method=`POST`, path=`/get-user`
+6. `QueryService` retrieves `SavedQuery`, sets datasource via `DataSourceContextHolder`
+7. `RoutingDataSource` routes to correct database
+8. `ResqlJdbcTemplate.queryOrExecute()` executes with bound parameters
+9. Results returned as JSON with `snake_case` → `camelCase` conversion
 
-Walk through the complete path from file to response:
+Key implications: no hot-reload, no startup syntax validation, path = API contract, auto-detection of SELECT vs write.
 
-1. Developer writes a `.sql` file with named parameters (`:paramName`)
-2. File placed in directory structure: `{config-path}/{project}/{METHOD}/query-name.sql`
-3. At startup, `SavedQueryService` loads all SQL files into `SavedQuery` records (query text + datasource name)
-4. Client sends `POST /byk/get-user` with body `{"userId": 123}`
-5. `QueryController` parses URL: project=`byk`, method=`POST`, path=`/get-user`
-6. `QueryService` retrieves the `SavedQuery`, sets datasource context via `DataSourceContextHolder`
-7. `RoutingDataSource` routes to the correct database
-8. `ResqlJdbcTemplate.queryOrExecute()` executes with bound parameters, auto-detects SELECT vs write
-9. Results returned as JSON with `snake_case` → `camelCase` column name conversion
+**Practical examples**: GET query, POST query, batch, adding a new query file, adding a new datasource.
 
-Key implications: no hot-reload (restart required for new queries), no syntax validation at startup, path-based routing where directory structure is the API contract.
-
-**Practical examples**: simple GET query, POST query, batch execution, adding a new query file, adding a new datasource.
-
-**Error Handling**
-
-Exception-to-HTTP mapping:
-- `NotFoundException` → 404 (query file not found)
-- `InvalidQueryException` → 400 (invalid parameters)
-- `InvalidDirectoryException` → 500 (directory misconfigured)
-- `UnknownDataSourceNameException` → 500 (datasource not configured, includes the unrecognized name in message)
-- `ResqlRuntimeException` → 500 (unexpected execution error)
+**Error mapping**: `NotFoundException` → 404, `InvalidQueryException` → 400, `InvalidDirectoryException` → 500, `UnknownDataSourceNameException` → 500, `ResqlRuntimeException` → 500.
 
 #### Updated README.md
 
-Restructure as entry point:
 - Brief introduction (2–3 sentences)
 - Architecture note: internal-only, called by Ruuter
 - Links to GUIDE.md, CONFIGURATION.md, SECURITY.md
